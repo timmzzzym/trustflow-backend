@@ -282,14 +282,39 @@ export class WebhookService implements BeforeApplicationShutdown {
       }
     }
     if (validEndpoints.length === 0) return;
-    const promises = validEndpoints.map(endpoint =>
-      this.sendWithRetry(endpoint.url, payload, 3, endpoint.secret),
-    );
-    
+
+    // Cap concurrent outbound deliveries so a large subscriber list (or a backlog
+    // catch-up burst) cannot exhaust file descriptors or trigger downstream
+    // rate-limit bans. Endpoints beyond the window are queued and start as soon
+    // as a slot frees up.
+    const CONCURRENCY_LIMIT = 10;
+    const settled: PromiseSettledResult<void>[] = [];
+
+    const runBounded = async (): Promise<void> => {
+      const queue = [...validEndpoints];
+      const active = new Set<Promise<void>>();
+
+      const launch = () => {
+        while (active.size < CONCURRENCY_LIMIT && queue.length > 0) {
+          const endpoint = queue.shift()!;
+          const task = this.sendWithRetry(endpoint.url, payload, 3, endpoint.secret)
+            .then(() => { settled.push({ status: 'fulfilled', value: undefined }); })
+            .catch((reason: unknown) => { settled.push({ status: 'rejected', reason }); })
+            .finally(() => { active.delete(task); launch(); });
+          active.add(task);
+        }
+      };
+
+      launch();
+      while (active.size > 0) {
+        await Promise.race(active);
+      }
+    };
+
     // Track in-flight webhook requests for graceful shutdown
-    const deliveryPromise = Promise.allSettled(promises).then(results => {
-      const failed = results.find(
-        (result): result is PromiseRejectedResult => result.status === 'rejected',
+    const deliveryPromise = runBounded().then(() => {
+      const failed = settled.find(
+        (r): r is PromiseRejectedResult => r.status === 'rejected',
       );
       if (failed) throw failed.reason;
     });

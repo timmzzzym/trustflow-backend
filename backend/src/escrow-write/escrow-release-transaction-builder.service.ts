@@ -1,14 +1,17 @@
-import { Inject, Injectable, ServiceUnavailableException } from '@nestjs/common';
+import { BadRequestException, Inject, Injectable, ServiceUnavailableException } from '@nestjs/common';
 import { SanitizedLogger } from '../common/logging/sanitized-logger';
 import {
   rpc as SorobanRpc,
   Contract,
+  Memo,
   TransactionBuilder,
+  Transaction,
   BASE_FEE,
   nativeToScVal,
 } from '@stellar/stellar-sdk';
 import { StellarConfig } from '../stellar/stellar.config';
 import { config } from '../config/env.config';
+import { STELLAR_MEMO_MAX_BYTES } from './escrow-write.dto';
 
 export const SOROBAN_RPC_SERVER = 'SOROBAN_RPC_SERVER';
 export const ESCROW_WRITE_STELLAR_CONFIG = 'ESCROW_WRITE_STELLAR_CONFIG';
@@ -53,6 +56,14 @@ export interface UnsignedReleaseTransaction {
   sourceAccount: string;
 }
 
+export interface UnsignedFeeBumpTransaction {
+  xdr: string;
+  network: string;
+  networkPassphrase: string;
+  feeAccount: string;
+  innerTransactionHash: string;
+}
+
 /**
  * Builds (but never signs or submits) the Soroban invocation that releases an escrow
  * on-chain — the write-path prototype for the #180 spike.
@@ -79,11 +90,22 @@ export class EscrowReleaseTransactionBuilderService {
   async buildRelease(
     contractEscrowId: string,
     sourceAccount: string,
+    memo?: string,
   ): Promise<UnsignedReleaseTransaction> {
     if (!this.isConfigured) {
       throw new ServiceUnavailableException(
         'TRUSTFLOW_CONTRACT_ID is not set; cannot build a release transaction with no contract to call.',
       );
+    }
+
+    if (memo !== undefined) {
+      const byteLength = Buffer.byteLength(memo, 'utf8');
+      if (byteLength > STELLAR_MEMO_MAX_BYTES) {
+        throw new BadRequestException(
+          `memo exceeds Stellar's ${STELLAR_MEMO_MAX_BYTES}-byte limit for text memos ` +
+            `(got ${byteLength} bytes). Shorten the memo or omit it.`,
+        );
+      }
     }
 
     const account = await this.rpcServer.getAccount(sourceAccount);
@@ -93,8 +115,8 @@ export class EscrowReleaseTransactionBuilderService {
       nativeToScVal(contractEscrowId, { type: 'string' }),
     );
 
-    const buildWithFee = (fee: string): TransactionBuilder =>
-      new TransactionBuilder(account, {
+    const buildWithFee = (fee: string): TransactionBuilder => {
+      const builder = new TransactionBuilder(account, {
         fee,
         networkPassphrase: this.config.networkPassphrase,
       })
@@ -103,6 +125,13 @@ export class EscrowReleaseTransactionBuilderService {
         // configured value means a held XDR expires quickly instead of remaining
         // submittable days later, after dispute/deliverable state has changed.
         .setTimeout(clampReleaseTxValidity(config.STELLAR_TX_VALIDITY_SECONDS));
+
+      if (memo !== undefined) {
+        builder.addMemo(Memo.text(memo));
+      }
+
+      return builder;
+    };
 
     // Simulate explicitly so the resource fee estimated from the contract invocation is
     // actually used. Relying on the flat BASE_FEE (or on prepareTransaction's implicit
@@ -139,6 +168,63 @@ export class EscrowReleaseTransactionBuilderService {
       networkPassphrase: this.config.networkPassphrase,
       contractId: this.config.contractId,
       sourceAccount,
+    };
+  }
+
+  /**
+   * Wraps an already-built unsigned inner transaction in a fee-bump envelope so
+   * the client can re-submit it with a higher fee after network congestion has
+   * made the original fee insufficient (#869).
+   *
+   * The fee-bump envelope must be signed by `feeAccount` before submission — the
+   * same client-side signing model as `buildRelease`; no keys are held server-side.
+   *
+   * @param unsignedInnerXdr - XDR of the original unsigned (or signed) inner transaction.
+   * @param newFeeStroops    - Total fee in stroops for the fee-bump transaction.
+   *                           Must be strictly greater than the inner transaction's fee.
+   * @param feeAccount       - Stellar address that will pay the bump fee and sign the envelope.
+   */
+  bumpFee(
+    unsignedInnerXdr: string,
+    newFeeStroops: string,
+    feeAccount: string,
+  ): UnsignedFeeBumpTransaction {
+    let innerTx: Transaction;
+    try {
+      innerTx = new Transaction(unsignedInnerXdr, this.config.networkPassphrase);
+    } catch {
+      throw new BadRequestException(
+        'unsignedInnerXdr is not a valid transaction envelope for this network.',
+      );
+    }
+
+    const innerFee = BigInt(innerTx.fee);
+    const bumpFee = BigInt(newFeeStroops);
+
+    if (bumpFee <= innerFee) {
+      throw new BadRequestException(
+        `newFeeStroops (${newFeeStroops}) must be greater than the inner transaction fee (${innerFee.toString()}).`,
+      );
+    }
+
+    const feeBump = TransactionBuilder.buildFeeBumpTransaction(
+      feeAccount,
+      newFeeStroops,
+      innerTx,
+      this.config.networkPassphrase,
+    );
+
+    this.logger.log(
+      `Built fee-bump envelope for inner tx ${innerTx.hash().toString('hex')} ` +
+        `with new fee ${newFeeStroops} stroops (was ${innerFee.toString()})`,
+    );
+
+    return {
+      xdr: feeBump.toXDR(),
+      network: this.config.network,
+      networkPassphrase: this.config.networkPassphrase,
+      feeAccount,
+      innerTransactionHash: innerTx.hash().toString('hex'),
     };
   }
 }
