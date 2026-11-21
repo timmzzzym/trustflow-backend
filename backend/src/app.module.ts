@@ -29,8 +29,6 @@ import { MilestoneNotificationsModule } from './milestone-notifications/mileston
 import { SorobanEventIndexerModule } from './soroban-event-indexer/soroban-event-indexer.module';
 import { OutboxModule } from './outbox/outbox.module';
 import { AuditModule } from './audit/audit.module';
-import { TracingModule } from './monitoring/tracing.module';
-
 import { CacheModule } from './common/cache.module';
 
 @Module({
@@ -64,7 +62,6 @@ import { CacheModule } from './common/cache.module';
     SorobanEventIndexerModule,
     OutboxModule,
     AuditModule,
-    TracingModule,
   ],
 })
 export class AppModule implements NestModule {

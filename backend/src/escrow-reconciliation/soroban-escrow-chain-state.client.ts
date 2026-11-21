@@ -57,7 +57,12 @@ export class SorobanEscrowChainStateClient extends EscrowChainStateClient {
       const native = scValToNative(entry.val.contractData().val());
       return this.toChainRecord(contractEscrowId, native);
     } catch (error) {
-      if (this.isNotFound(error)) return undefined;
+      // A "not found" response is a valid on-chain state: the escrow does not exist.
+      // But a timeout or network error is an UNKNOWN state — it must NOT be treated as
+      // "not found" (#864). We only return undefined for explicit "not found" responses;
+      // every other error is re-thrown so the reconciler records it as a failed read
+      // (errors[]) rather than silently marking the escrow as reconciled.
+      if (this.isNotFound(error) && !this.isTimeout(error)) return undefined;
       if (error instanceof InvalidChainStateError) throw error;
       this.logger.error(
         `Failed to read chain state for escrow ${contractEscrowId}`,
@@ -75,5 +80,25 @@ export class SorobanEscrowChainStateClient extends EscrowChainStateClient {
     const message =
       error instanceof Error ? error.message : (error as { message?: string } | undefined)?.message;
     return typeof message === 'string' && message.includes('Contract data not found');
+  }
+
+  /**
+   * Returns true when the error is a network/RPC timeout (#864).
+   * Timeout errors must NOT be treated as "not found" — the on-chain state is unknown,
+   * so the reconciler must record the read as a failure and leave the escrow's
+   * reconciliation status as UNKNOWN/PENDING rather than silently marking it resolved.
+   */
+  private isTimeout(error: unknown): boolean {
+    const message =
+      error instanceof Error ? error.message : (error as { message?: string } | undefined)?.message;
+    if (typeof message !== 'string') return false;
+    const lower = message.toLowerCase();
+    return (
+      lower.includes('timeout') ||
+      lower.includes('timed out') ||
+      lower.includes('econnaborted') ||
+      lower.includes('request aborted') ||
+      lower.includes('network error')
+    );
   }
 }
